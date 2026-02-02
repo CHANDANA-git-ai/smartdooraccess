@@ -1,0 +1,99 @@
+#include <Wire.h>
+#include <LiquidCrystal_I2C.h>
+#include <SPI.h>
+#include <MFRC522.h>
+#include <Servo.h>
+
+// Pin definitions
+#define SS_PIN D2
+#define RST_PIN D1
+#define LED_PIN D0
+#define SERVO_PIN D8
+
+MFRC522 mfrc522(SS_PIN, RST_PIN);
+LiquidCrystal_I2C lcd(0x27, 16, 2);
+Servo servoMotor;
+
+String authorizedUID = "53D8F013";  // Change this to your RFID card UID
+
+void setup() {
+  Serial.begin(9600);
+  SPI.begin();
+  mfrc522.PCD_Init();
+
+  Wire.begin(D3, D4); // SDA, SCL for I2C LCD
+  lcd.init();
+  lcd.backlight();
+
+  pinMode(LED_PIN, OUTPUT);
+  digitalWrite(LED_PIN, LOW);
+
+  servoMotor.attach(SERVO_PIN);
+  servoMotor.write(0); // Lock position
+
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print("System Ready");
+  delay(1500);
+  lcd.clear();
+  lcd.print("Scan your card");
+}
+
+void loop() {
+  // Wait for RFID card
+  if (!mfrc522.PICC_IsNewCardPresent() || !mfrc522.PICC_ReadCardSerial())
+    return;
+
+  String uidStr = "";
+  for (byte i = 0; i < mfrc522.uid.size; i++) {
+    uidStr += String(mfrc522.uid.uidByte[i], HEX);
+  }
+  uidStr.toUpperCase();
+
+  lcd.clear();
+  if (uidStr == authorizedUID) {
+    lcd.print("Card OK, Face->");
+    Serial.println("RFID_OK");  // Notify Python app for face check
+  } else {
+    lcd.print("Access Denied");
+    Serial.println("RFID_FAIL");
+    delay(2000);
+    lcd.clear();
+    lcd.print("Scan your card");
+    return;
+  }
+
+  // Wait for face verification result from Python
+  unsigned long startTime = millis();
+  while (millis() - startTime < 10000) {  // wait max 10s
+    if (Serial.available()) {
+      String result = Serial.readStringUntil('\n');
+      result.trim();
+
+      if (result == "FACE_OK") {
+        lcd.clear();
+        lcd.print("Access Granted");
+        digitalWrite(LED_PIN, HIGH);
+        servoMotor.write(180); // Unlock door
+        delay(3000);
+        servoMotor.write(0); // Lock again
+        digitalWrite(LED_PIN, LOW);
+      } 
+      else if (result == "FACE_FAIL") {
+        lcd.clear();
+        lcd.print("Face Not Match");
+      }
+
+      delay(2000);
+      lcd.clear();
+      lcd.print("Scan your card");
+      return;
+    }
+  }
+
+  lcd.clear();
+  lcd.print("Timeout...");
+  delay(2000);
+  lcd.clear();
+  lcd.print("Scan your card");
+}
