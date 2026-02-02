@@ -1,0 +1,244 @@
+import cv2
+import os
+import serial
+import tkinter as tk
+from tkinter import simpledialog, messagebox
+import pandas as pd
+from datetime import datetime
+import numpy as np
+
+# ==== CONFIG ====
+ESP_PORT = 'COM6'
+CASCADE_PATH = cv2.data.haarcascades + 'haarcascade_frontalface_default.xml'
+DATASET_PATH = "dataset"
+TRAINER_PATH = "trainer.yml"
+LOG_FILE = "access_log.csv"
+
+# ==== SERIAL SETUP ====
+try:
+    esp = serial.Serial(ESP_PORT, 9600, timeout=1)
+    print("[INFO] Connected to ESP8266.")
+except Exception:  # catch SerialException name differences
+    esp = None
+    print("[WARN] ESP8266 not connected. Running in offline mode.")
+
+# ==== GUI SETUP ====
+root = tk.Tk()
+root.title("Smart Access Control System")
+root.geometry("450x350")
+
+status_label = tk.Label(root, text="Waiting for RFID...", font=("Arial", 14))
+status_label.pack(pady=20)
+
+# ==== FACE RECOGNIZER ====
+recognizer = cv2.face.LBPHFaceRecognizer_create()
+face_cascade = cv2.CascadeClassifier(CASCADE_PATH)
+
+if os.path.exists(TRAINER_PATH):
+    try:
+        recognizer.read(TRAINER_PATH)
+    except Exception as e:
+        print("[WARN] Could not load trainer.yml:", e)
+
+names = ["Unknown"]
+if os.path.exists("names.txt"):
+    with open("names.txt", "r") as f:
+        names = f.read().splitlines()
+
+# ==== LOGGING ====
+def log_access(rfid_uid, rfid_result, face_result, final_result):
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    df = pd.DataFrame([{
+        "DateTime": now,
+        "RFID_UID": rfid_uid,
+        "RFID_Result": rfid_result,
+        "Face_Result": face_result,
+        "Final_Access": final_result
+    }])
+    if not os.path.exists(LOG_FILE):
+        df.to_csv(LOG_FILE, index=False)
+    else:
+        df.to_csv(LOG_FILE, mode='a', header=False, index=False)
+
+# ==== CAPTURE NEW USER ====
+def capture_new_user():
+    name = simpledialog.askstring("New User", "Enter new user name:")
+    if not name:
+        return
+
+    user_id = len(names)
+    user_folder = os.path.join(DATASET_PATH, str(user_id))
+    os.makedirs(user_folder, exist_ok=True)
+
+    cam = cv2.VideoCapture(0)
+    count = 0
+    messagebox.showinfo("Capture", "Look at the camera — capturing 30 images.")
+
+    while True:
+        ret, frame = cam.read()
+        if not ret:
+            break
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        faces = face_cascade.detectMultiScale(gray, 1.3, 5)
+        for (x, y, w, h) in faces:
+            count += 1
+            cv2.imwrite(f"{user_folder}/{count}.jpg", gray[y:y+h, x:x+w])
+            cv2.rectangle(frame, (x, y), (x+w, y+h), (0,255,0), 2)
+            cv2.imshow("Capturing Face", frame)
+
+        if cv2.waitKey(1) & 0xFF == 27:  # ESC
+            break
+        elif count >= 30:
+            break
+
+    cam.release()
+    cv2.destroyAllWindows()
+
+    # Save name
+    names.append(name)
+    with open("names.txt", "w") as f:
+        for n in names:
+            f.write(n + "\n")
+
+    messagebox.showinfo("Training", "Training face recognizer...")
+    train_faces()
+    messagebox.showinfo("Done", f"{name} added successfully!")
+
+# ==== TRAINING ====
+def train_faces():
+    faces = []
+    ids = []
+
+    for user_id, user_name in enumerate(names):
+        if user_name == "Unknown":
+            continue
+        path = os.path.join(DATASET_PATH, str(user_id))
+        if not os.path.exists(path):
+            continue
+        for img_name in os.listdir(path):
+            img_path = os.path.join(path, img_name)
+            gray = cv2.imread(img_path, cv2.IMREAD_GRAYSCALE)
+            if gray is not None:
+                faces.append(gray)
+                ids.append(user_id)
+
+    if len(faces) == 0:
+        print("[WARN] No training images found. Skipping trainer update.")
+        return
+
+    recognizer.train(faces, np.array(ids))
+    recognizer.save(TRAINER_PATH)
+    print("[INFO] Training complete!")
+
+# ==== FACE RECOGNITION ====
+def recognize_face(rfid_uid="53D8F013"):
+    cam = cv2.VideoCapture(0)
+    recognized = False
+    face_result = "No Face"
+
+    while True:
+        ret, frame = cam.read()
+        if not ret:
+            break
+
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        faces = face_cascade.detectMultiScale(gray, 1.2, 5)
+
+        for (x, y, w, h) in faces:
+            try:
+                id_, confidence = recognizer.predict(gray[y:y+h, x:x+w])
+            except Exception as e:
+                print("[WARN] Recognizer predict failed:", e)
+                continue
+
+            if confidence < 70:
+                name = names[id_] if id_ < len(names) else "Unknown"
+                face_result = "Match"
+                recognized = True
+                color = (0, 255, 0)
+                label = f"{name} ({round(confidence, 2)})"
+            else:
+                name = "Unknown"
+                face_result = "Not Match"
+                color = (0, 0, 255)
+                label = name
+
+            cv2.rectangle(frame, (x, y), (x+w, y+h), color, 2)
+            cv2.putText(frame, label, (x, y-10), cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2)
+
+        cv2.imshow('Face Recognition', frame)
+        if cv2.waitKey(1) & 0xFF == 27:
+            break
+        if recognized:
+            break
+
+    cam.release()
+    cv2.destroyAllWindows()
+
+    if esp:
+        if recognized:
+            try:
+                esp.write(b"FACE_OK\n")
+            except Exception as e:
+                print("[WARN] Could not write to serial:", e)
+            status_label.config(text="Access Granted ✅")
+            log_access(rfid_uid, "Authorized", face_result, "Granted")
+        else:
+            try:
+                esp.write(b"FACE_FAIL\n")
+            except Exception as e:
+                print("[WARN] Could not write to serial:", e)
+            status_label.config(text="Face Not Recognized ❌")
+            log_access(rfid_uid, "Authorized", face_result, "Denied")
+    else:
+        # offline mode: still log and show result
+        if recognized:
+            status_label.config(text="Access Granted ✅ (offline)")
+            log_access(rfid_uid, "Authorized", face_result, "Granted")
+        else:
+            status_label.config(text="Face Not Recognized ❌ (offline)")
+            log_access(rfid_uid, "Authorized", face_result, "Denied")
+
+    # Return to RFID waiting
+    root.after(3000, lambda: status_label.config(text="Waiting for RFID..."))
+
+# ==== SERIAL HANDLER ====
+def check_serial():
+    try:
+        if esp and esp.in_waiting:
+            data = esp.readline().decode(errors='ignore').strip()
+            if data:
+                print(f"[ESP] {data}")
+                # normalize common variations
+                d = data.strip().upper()
+                if d == "RFID_OK" or "RFID_OK" in d:
+                    status_label.config(text="Authorized card detected!")
+                    # If ESP sends card UID instead, forward it here: try to extract UID
+                    # call recognize with the UID (keep as placeholder if not sent)
+                    recognize_face("53D8F013")
+                elif d == "RFID_FAIL" or "RFID_FAIL" in d:
+                    status_label.config(text="Unauthorized card ❌")
+                    log_access("Unknown", "Unauthorized", "-", "Denied")
+                    # reset status after short delay so it waits for next card
+                    root.after(3000, lambda: status_label.config(text="Waiting for RFID..."))
+
+        root.after(100, check_serial)
+    except Exception as e:
+        print("Serial Error:", e)
+        root.after(100, check_serial)
+
+# ==== BUTTONS ====
+add_user_btn = tk.Button(root, text="➕ Add New User", command=capture_new_user, font=("Arial", 12))
+add_user_btn.pack(pady=10)
+
+exit_btn = tk.Button(root, text="Exit", command=root.quit, font=("Arial", 12))
+exit_btn.pack(pady=10)
+
+# ==== START ====
+if esp:
+    root.after(100, check_serial)
+else:
+    # still run check_serial loop in offline mode so GUI behaves the same
+    root.after(100, check_serial)
+
+root.mainloop()
